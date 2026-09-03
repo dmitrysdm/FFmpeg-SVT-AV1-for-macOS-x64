@@ -1,0 +1,654 @@
+```yaml
+name: Build FFmpeg for macOS Intel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FFMPEG_VERSION: "9.0.1"
+  FFMPEG_COMMIT: "bf1b838f2ab88b4f8fd83443325c782ea0e0f7fa"
+
+  SVT_AV1_VERSION: "4.2.0"
+  SVT_AV1_TAG: "v4.2.0"
+
+  OPUS_VERSION: "1.5.2"
+
+  PACKAGE_NAME: "FFmpeg-9.0.1-SVT-AV1-4.2.0-for-macOS-x64"
+
+jobs:
+  build:
+    name: Build FFmpeg 9.0.1 for macOS Intel
+    runs-on: macos-13
+
+    steps:
+
+      # Check out the repository.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install build tools required for FFmpeg, SVT-AV1 and Opus.
+      - name: Install build dependencies
+        run: |
+          brew install \
+            cmake \
+            nasm \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool
+
+      # Verify that the GitHub runner is Intel x86_64.
+      - name: Verify build architecture
+        run: |
+          echo "========================================"
+          echo "System"
+          echo "========================================"
+
+          uname -a
+
+          echo ""
+          echo "Architecture:"
+          uname -m
+
+          echo ""
+          echo "CPU:"
+          sysctl -n machdep.cpu.brand_string
+
+          echo ""
+          echo "CPU cores:"
+          sysctl -n hw.ncpu
+
+          echo ""
+          echo "Compiler:"
+          clang --version
+
+          echo ""
+          echo "CMake:"
+          cmake --version
+
+          echo ""
+          echo "NASM:"
+          nasm -v
+
+          if [ "$(uname -m)" != "x86_64" ]; then
+            echo "ERROR: This workflow requires an Intel x86_64 runner."
+            exit 1
+          fi
+
+      # Prepare source, build, installation and distribution directories.
+      - name: Prepare directories
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/build"
+          rm -rf "$GITHUB_WORKSPACE/dist"
+
+          mkdir -p "$GITHUB_WORKSPACE/build/src"
+          mkdir -p "$GITHUB_WORKSPACE/build/prefix"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+
+          echo "BUILD_ROOT=$GITHUB_WORKSPACE/build" >> "$GITHUB_ENV"
+          echo "SRC_DIR=$GITHUB_WORKSPACE/build/src" >> "$GITHUB_ENV"
+          echo "PREFIX=$GITHUB_WORKSPACE/build/prefix" >> "$GITHUB_ENV"
+
+      # Build SVT-AV1 4.2.0 as a static library.
+      - name: Build SVT-AV1
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          git clone \
+            --depth 1 \
+            --branch "$SVT_AV1_TAG" \
+            https://github.com/AOMediaCodec/SVT-AV1.git \
+            svt-av1
+
+          cd svt-av1
+
+          cmake -S . -B build \
+            -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_APPS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_NASM=ON
+
+          cmake \
+            --build build \
+            --parallel "$(sysctl -n hw.ncpu)"
+
+          cmake \
+            --install build
+
+      # Verify that the static SVT-AV1 library was installed.
+      - name: Verify SVT-AV1
+        run: |
+          echo "SVT-AV1 static libraries:"
+
+          find "$PREFIX/lib" \
+            -maxdepth 1 \
+            -name "libSvtAv1Enc*.a" \
+            -print
+
+          echo ""
+          echo "SVT-AV1 headers:"
+
+          find "$PREFIX/include" \
+            -maxdepth 2 \
+            -type f \
+            -print
+
+          if ! find "$PREFIX/lib" \
+            -maxdepth 1 \
+            -name "libSvtAv1Enc*.a" \
+            | grep -q .; then
+
+            echo "ERROR: Static SVT-AV1 library was not installed."
+            exit 1
+          fi
+
+      # Download and build Opus as a static library.
+      - name: Build libopus
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          curl -L \
+            "https://github.com/xiph/opus/releases/download/v${OPUS_VERSION}/opus-${OPUS_VERSION}.tar.gz" \
+            -o "opus-${OPUS_VERSION}.tar.gz"
+
+          tar xf "opus-${OPUS_VERSION}.tar.gz"
+
+          cd "opus-${OPUS_VERSION}"
+
+          ./configure \
+            --prefix="$PREFIX" \
+            --disable-shared \
+            --enable-static \
+            --disable-doc \
+            --disable-extra-programs
+
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      # Verify that the static Opus library was installed.
+      - name: Verify libopus
+        run: |
+          echo "Opus static library:"
+
+          find "$PREFIX/lib" \
+            -maxdepth 1 \
+            -name "libopus.a" \
+            -print
+
+          if [ ! -f "$PREFIX/lib/libopus.a" ]; then
+            echo "ERROR: Static libopus.a was not installed."
+            exit 1
+          fi
+
+      # Build FFmpeg 9.0.1 from the exact specified commit.
+      - name: Build FFmpeg
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          git clone \
+            https://git.ffmpeg.org/ffmpeg.git \
+            ffmpeg
+
+          cd ffmpeg
+
+          git checkout "$FFMPEG_COMMIT"
+
+          echo "========================================"
+          echo "FFmpeg commit"
+          echo "========================================"
+
+          git rev-parse HEAD
+
+          echo ""
+          echo "FFmpeg version:"
+
+          git describe --tags --always --dirty
+
+          # Make pkg-config find the locally built static libraries.
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+
+          # Tell the compiler where the locally built headers are.
+          export CPPFLAGS="-I$PREFIX/include"
+
+          # Tell the linker where the locally built static libraries are.
+          export LDFLAGS="-L$PREFIX/lib"
+
+          # Force static linking of the external libraries.
+          export LIBS="-lpthread -lm"
+
+          ./configure \
+            --prefix="$PREFIX/ffmpeg" \
+            --cc=clang \
+            --cxx=clang++ \
+            --arch=x86_64 \
+            --target-os=darwin \
+            --disable-debug \
+            --disable-doc \
+            --disable-autodetect \
+            --enable-ffmpeg \
+            --enable-ffplay \
+            --enable-ffprobe \
+            --enable-avcodec \
+            --enable-avformat \
+            --enable-avfilter \
+            --enable-swscale \
+            --enable-swresample \
+            --enable-protocol=file \
+            --enable-protocol=pipe \
+            --enable-libsvtav1 \
+            --enable-libopus \
+            --enable-gpl \
+            --enable-version3 \
+            --extra-cflags="-I$PREFIX/include" \
+            --extra-ldflags="-L$PREFIX/lib"
+
+          make -j"$(sysctl -n hw.ncpu)"
+
+          make install
+
+      # Verify that all three FFmpeg binaries were built.
+      - name: Verify FFmpeg binaries
+        run: |
+          echo "========================================"
+          echo "FFmpeg binaries"
+          echo "========================================"
+
+          ls -lh "$PREFIX/ffmpeg/bin/"
+
+          for BINARY in ffmpeg ffplay ffprobe; do
+
+            if [ ! -x "$PREFIX/ffmpeg/bin/$BINARY" ]; then
+              echo "ERROR: $BINARY was not built."
+              exit 1
+            fi
+
+            echo ""
+            echo "========================================"
+            echo "$BINARY"
+            echo "========================================"
+
+            file "$PREFIX/ffmpeg/bin/$BINARY"
+
+            lipo -info "$PREFIX/ffmpeg/bin/$BINARY"
+
+            if ! file "$PREFIX/ffmpeg/bin/$BINARY" \
+              | grep -q "x86_64"; then
+
+              echo "ERROR: $BINARY was not built for x86_64."
+              exit 1
+            fi
+          done
+
+      # Verify the FFmpeg versions.
+      - name: Verify FFmpeg versions
+        run: |
+          echo "========================================"
+          echo "FFmpeg"
+          echo "========================================"
+
+          "$PREFIX/ffmpeg/bin/ffmpeg" \
+            -hide_banner \
+            -version \
+            | head -5
+
+          echo ""
+          echo "========================================"
+          echo "FFprobe"
+          echo "========================================"
+
+          "$PREFIX/ffmpeg/bin/ffprobe" \
+            -hide_banner \
+            -version \
+            | head -5
+
+          echo ""
+          echo "========================================"
+          echo "FFplay"
+          echo "========================================"
+
+          "$PREFIX/ffmpeg/bin/ffplay" \
+            -hide_banner \
+            -version \
+            | head -5
+
+      # Verify the required FFmpeg encoders, filters and pixel format.
+      - name: Verify FFmpeg features
+        run: |
+          FF="$PREFIX/ffmpeg/bin/ffmpeg"
+
+          echo "========================================"
+          echo "SVT-AV1 encoder"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -encoders \
+            | grep -E 'libsvtav1'
+
+          echo ""
+          echo "========================================"
+          echo "Opus encoder"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -encoders \
+            | grep -E 'libopus'
+
+          echo ""
+          echo "========================================"
+          echo "SRT subtitle encoder"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -encoders \
+            | grep -E 'srt'
+
+          echo ""
+          echo "========================================"
+          echo "Required filters"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -filters \
+            | grep -E \
+              '(^| )scale( |$)|(^| )fps( |$)|(^| )setsar( |$)|(^| )dynaudnorm( |$)'
+
+          echo ""
+          echo "========================================"
+          echo "10-bit pixel format"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -pix_fmts \
+            | grep -E 'yuv420p10le'
+
+          echo ""
+          echo "========================================"
+          echo "SVT-AV1 encoder options"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -h encoder=libsvtav1 \
+            | grep -E \
+              'preset|crf|film-grain|tune|gop|pix_fmt' \
+              || true
+
+          echo ""
+          echo "========================================"
+          echo "Opus encoder options"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -h encoder=libopus \
+            | head -60
+
+      # Verify that SVT-AV1 and Opus are statically linked.
+      - name: Verify static external libraries
+        run: |
+          echo "========================================"
+          echo "Checking FFmpeg dynamic dependencies"
+          echo "========================================"
+
+          for BINARY in ffmpeg ffplay ffprobe; do
+
+            BIN="$PREFIX/ffmpeg/bin/$BINARY"
+
+            echo ""
+            echo "----------------------------------------"
+            echo "$BINARY"
+            echo "----------------------------------------"
+
+            otool -L "$BIN"
+
+            if otool -L "$BIN" | grep -Ei \
+              'SvtAv1|svtav1|opus'; then
+
+              echo ""
+              echo "ERROR: $BINARY contains a dynamic dependency"
+              echo "on SVT-AV1 or Opus."
+              exit 1
+            fi
+
+          done
+
+          echo ""
+          echo "SUCCESS: SVT-AV1 and Opus are statically linked."
+
+      # Prepare the final distribution package.
+      - name: Prepare distribution
+        run: |
+          PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
+
+          mkdir -p "$PACKAGE_DIR/bin"
+          mkdir -p "$PACKAGE_DIR/licenses"
+
+          # Copy all three FFmpeg binaries.
+          cp \
+            "$PREFIX/ffmpeg/bin/ffmpeg" \
+            "$PACKAGE_DIR/bin/ffmpeg"
+
+          cp \
+            "$PREFIX/ffmpeg/bin/ffplay" \
+            "$PACKAGE_DIR/bin/ffplay"
+
+          cp \
+            "$PREFIX/ffmpeg/bin/ffprobe" \
+            "$PACKAGE_DIR/bin/ffprobe"
+
+          # Copy SVT-AV1 license.
+          if [ -f "$SRC_DIR/svt-av1/LICENSE" ]; then
+            cp \
+              "$SRC_DIR/svt-av1/LICENSE" \
+              "$PACKAGE_DIR/licenses/SVT-AV1-LICENSE"
+          fi
+
+          # Copy Opus license.
+          if [ -f "$SRC_DIR/opus-${OPUS_VERSION}/COPYING" ]; then
+            cp \
+              "$SRC_DIR/opus-${OPUS_VERSION}/COPYING" \
+              "$PACKAGE_DIR/licenses/Opus-COPYING"
+          fi
+
+          # Copy FFmpeg license.
+          if [ -f "$SRC_DIR/ffmpeg/COPYING.LGPLv2.1" ]; then
+            cp \
+              "$SRC_DIR/ffmpeg/COPYING.LGPLv2.1" \
+              "$PACKAGE_DIR/licenses/FFmpeg-COPYING.LGPLv2.1"
+          fi
+
+      # Test the packaged FFmpeg binary and the SVT-AV1 encoder.
+      - name: Test packaged FFmpeg
+        run: |
+          PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
+
+          FF="$PACKAGE_DIR/bin/ffmpeg"
+
+          echo "========================================"
+          echo "Testing FFmpeg"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -version
+
+          echo ""
+          echo "========================================"
+          echo "Testing SVT-AV1 encoder"
+          echo "========================================"
+
+          "$FF" \
+            -hide_banner \
+            -f lavfi \
+            -i "color=c=black:s=320x240:r=1" \
+            -frames:v 1 \
+            -c:v libsvtav1 \
+            -preset 5 \
+            -crf 32 \
+            -pix_fmt yuv420p10le \
+            -f null \
+            -
+
+          echo ""
+          echo "Packaged FFmpeg test completed successfully."
+
+      # Test FFprobe.
+      - name: Test packaged FFprobe
+        run: |
+          PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
+
+          "$PACKAGE_DIR/bin/ffprobe" \
+            -hide_banner \
+            -version
+
+      # Test FFplay startup.
+      - name: Test packaged FFplay
+        run: |
+          PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
+
+          "$PACKAGE_DIR/bin/ffplay" \
+            -hide_banner \
+            -version
+
+      # Create package metadata.
+      - name: Create README
+        run: |
+          PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
+
+          cat > "$PACKAGE_DIR/README.txt" <<EOF
+          FFmpeg macOS Intel build
+
+          Package:
+            $PACKAGE_NAME
+
+          Architecture:
+            x86_64
+
+          Target:
+            macOS Intel
+
+          FFmpeg:
+            $FFMPEG_VERSION
+            commit: $FFMPEG_COMMIT
+
+          SVT-AV1:
+            $SVT_AV1_VERSION
+            statically linked
+
+          Opus:
+            $OPUS_VERSION
+            statically linked
+
+          Included binaries:
+            ffmpeg
+            ffplay
+            ffprobe
+
+          External libraries:
+            SVT-AV1: statically linked
+            Opus: statically linked
+
+          Required video features:
+            libsvtav1
+            yuv420p10le
+            scale
+            fps
+            setsar
+
+          Required audio features:
+            libopus
+            dynaudnorm
+
+          Subtitle support:
+            SRT
+
+          Example video encoding:
+
+            -c:v libsvtav1
+            -preset 5
+            -crf 32
+            -g 240
+            -pix_fmt yuv420p10le
+            -svtav1-params tune=0:film-grain=8
+
+          Example video filter:
+
+            -vf scale=1920:-2:flags=lanczos,setsar=1,fps=30
+
+          Example audio encoding:
+
+            -c:a libopus
+            -b:a 256k
+            -ac 2
+            -af dynaudnorm
+
+          Example subtitle encoding:
+
+            -c:s srt
+
+          SVT-AV1 and Opus are statically linked
+          into ffmpeg, ffplay and ffprobe.
+
+          This package was built for Intel Macs (x86_64).
+          EOF
+
+      # Display the final package contents.
+      - name: Show package contents
+        run: |
+          PACKAGE_DIR="$GITHUB_WORKSPACE/dist/$PACKAGE_NAME"
+
+          echo "========================================"
+          echo "Package contents"
+          echo "========================================"
+
+          find "$PACKAGE_DIR" -print
+
+          echo ""
+          echo "========================================"
+          echo "Binary sizes"
+          echo "========================================"
+
+          ls -lh "$PACKAGE_DIR/bin/"
+
+          echo ""
+          echo "========================================"
+          echo "Dynamic dependencies"
+          echo "========================================"
+
+          for BINARY in ffmpeg ffplay ffprobe; do
+            echo ""
+            echo "$BINARY:"
+            otool -L "$PACKAGE_DIR/bin/$BINARY"
+          done
+
+      # Create the final tar.gz archive.
+      - name: Create archive
+        working-directory: ${{ env.GITHUB_WORKSPACE }}/dist
+        run: |
+          tar \
+            -czf \
+            "$PACKAGE_NAME.tar.gz" \
+            "$PACKAGE_NAME"
+
+          echo "Created archive:"
+          ls -lh "$PACKAGE_NAME.tar.gz"
+
+      # Upload the final package as a GitHub Actions artifact.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            dist/${{ env.PACKAGE_NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+```
