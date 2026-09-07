@@ -423,7 +423,6 @@ jobs:
             --enable-avdevice \
             --enable-swscale \
             --enable-swresample \
-            --enable-postproc \
             --enable-network \
             --enable-protocol=file \
             --enable-protocol=pipe \
