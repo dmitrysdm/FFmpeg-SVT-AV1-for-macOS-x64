@@ -741,7 +741,7 @@ jobs:
             SDL2_REALPATH="$(
               realpath "$SDL2_DEPENDENCY" 2>/dev/null \
               || true
-            )
+            )"
 
             if [ -n "$SDL2_REALPATH" ] \
               && [ -f "$SDL2_REALPATH" ]; then
